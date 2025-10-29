@@ -23,6 +23,52 @@ BASE_OUT = pathlib.Path("data")
 BRONZE = BASE_OUT / "raw"
 SILVER = BASE_OUT / "silver"
 
+# ---- Zillow schema & label maps (from dataset card) ----
+ZILLOW_BASE_COLS = {
+    "days_on_market": {"Region ID","Size Rank","Region","Region Type","State","Home Type","Date"},
+    "for_sale_listings": {"Region ID","Size Rank","Region","Region Type","State","Home Type","Date"},
+    "home_values": {"Region ID","Size Rank","Region","Region Type","State","Home Type","Bedroom Count","Date"},
+    "home_values_forecasts": {"Region ID","Size Rank","Region","Region Type","State","City","Metro","County","Home Type","Date"},
+    "new_construction": {"Region ID","Size Rank","Region","Region Type","State","Home Type","Date"},
+    "rentals": {"Region ID","Size Rank","Region","Region Type","State","Home Type","Date"},
+    "sales": {"Region ID","Size Rank","Region","Region Type","State","Home Type","Date"},
+}
+
+# Region Type encodings differ per config (per dataset card)
+ZILLOW_REGION_TYPE = {
+    "days_on_market": {0:"zip",1:"city",2:"county",3:"msa",4:"state",5:"country"},
+    "for_sale_listings": {0:"zip",1:"city",2:"county",3:"msa",4:"state"},
+    "home_values": {0:"zip",1:"city",2:"county",3:"msa",4:"state",5:"country"},
+    "home_values_forecasts": {0:"county",1:"city",2:"zip",3:"country",4:"msa"},
+    "new_construction": {0:"county",1:"city",2:"zip",3:"country",4:"msa"},
+    "rentals": {0:"county",1:"city",2:"zip",3:"country",4:"msa"},
+    "sales": {0:"county",1:"city",2:"zip",3:"country",4:"msa"},
+}
+
+# Home Type encodings differ per config (per dataset card)
+ZILLOW_HOME_TYPE = {
+    # days_on_market & home_values:
+    "_type_A": {0:"multifamily",1:"condo/co-op",2:"SFR",3:"all homes",4:"all homes + multifamily"},
+    # for_sale_listings, new_construction, rentals, sales:
+    "_type_B": {0:"all homes",1:"all homes + multifamily",2:"SFR",3:"condo/co-op",4:"multifamily"},
+}
+ZILLOW_HOME_TYPE_BY_CONFIG = {
+    "days_on_market": ZILLOW_HOME_TYPE["_type_A"],
+    "home_values": ZILLOW_HOME_TYPE["_type_A"],
+    "for_sale_listings": ZILLOW_HOME_TYPE["_type_B"],
+    "new_construction": ZILLOW_HOME_TYPE["_type_B"],
+    "rentals": ZILLOW_HOME_TYPE["_type_B"],
+    "sales": ZILLOW_HOME_TYPE["_type_B"],
+    # forecasts uses free-text Home Type; no mapping needed
+}
+
+# Bedroom labels (home_values only)
+ZILLOW_BEDROOM_LABELS = {
+    0:"1-Bedroom", 1:"2-Bedrooms", 2:"3-Bedrooms",
+    3:"4-Bedrooms", 4:"5+-Bedrooms", 5:"All Bedrooms"
+}
+
+
 # Region hierarchy levels
 REGION_LEVELS = {
     "nation": ["usa", "united states", "national"],
@@ -373,128 +419,167 @@ def standardize_dates(df: pl.DataFrame, date_cols: List[str]) -> pl.DataFrame:
 
 def transform_zillow_dataset(config_name: str, bronze_path: pathlib.Path, schema_mgr: SchemaManager) -> Dict[str, pl.DataFrame]:
     """
-    Transform a single Zillow dataset into multiple silver tables
-    Returns dict of {level: dataframe} for different aggregation levels
+    Transform ONE Zillow config folder into:
+      - 'wide' (cleaned base columns + all value columns)
+      - 'long' (normalized: one row per metric per date per region/home-type)
+    We DO NOT aggregate or guess region level; we map label-encodings per config.
     """
-    
-    # Read raw data
-    parquet_files = list(bronze_path.glob("*.parquet"))
-    if not parquet_files:
-        # Check for train subdirectory (Hugging Face structure)
-        parquet_files = list((bronze_path / "train").glob("*.parquet"))
-    
-    if not parquet_files:
+    # 1) locate parquet shards
+    shards = list(bronze_path.glob("*.parquet"))
+    if not shards:
+        shards = list((bronze_path / "train").glob("*.parquet"))
+    if not shards:
         raise ValueError(f"No parquet files found in {bronze_path}")
-    
-    # Load data
-    df = pl.scan_parquet([str(f) for f in parquet_files]).collect()
-    
-    print(f"  Processing {config_name}: {df.height:,} rows, {len(df.columns)} columns")
-    
-    # Detect column types
-    region_cols = detect_region_columns(df)
-    date_cols = detect_date_columns(df)
-    
-    # Standardize dates
-    if date_cols:
-        df = standardize_dates(df, date_cols)
-    
-    # Add region hierarchy
-    df = create_region_hierarchy(df, region_cols)
-    
-    # Extract all metrics with metadata
-    metrics = extract_all_metrics(df, schema_mgr)
-    
-    # Create column groups for organized output
-    id_cols = ["region_key", "region_level"]
-    if "region_id" in df.columns:
-        id_cols.append("region_id")
-    
-    geo_cols = []
-    for col in ["state", "state_code", "county", "city", "metro", "zip"]:
-        if region_cols.get(col) is not None:
-            if region_cols[col] in df.columns:
-                geo_cols.append(region_cols[col])
-    
-    date_cols_final = ["date", "year", "month", "quarter", "week"]
-    date_cols_final = [c for c in date_cols_final if c in df.columns]
-    
-    metric_cols = list(metrics.keys())
-    
-    # Build final dataframe with all columns organized - ensure uniqueness
-    all_cols = id_cols + geo_cols + date_cols_final + metric_cols
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_cols = []
-    for col in all_cols:
-        if col not in seen and col in df.columns:
-            seen.add(col)
-            unique_cols.append(col)
-    
-    df_final = df.select(unique_cols)
-    
-    # Create aggregated views for different region levels
-    results = {}
-    
-    # Original granularity
-    results["original"] = df_final
-    
-    # Aggregate by different levels if data supports it
-    has_state = region_cols.get("state") is not None and region_cols["state"] in df.columns
-    if has_state or "state" in df.columns:
-        # State level aggregation
-        state_col = region_cols["state"] if region_cols.get("state") else "state"
-        if state_col in df.columns and "date" in df.columns:
-            agg_exprs = []
-            for metric in metric_cols:
-                if df[metric].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]:
-                    agg_exprs.extend([
-                        pl.col(metric).mean().alias(f"{metric}_mean"),
-                        pl.col(metric).median().alias(f"{metric}_median"),
-                        pl.col(metric).std().alias(f"{metric}_std"),
-                        pl.col(metric).min().alias(f"{metric}_min"),
-                        pl.col(metric).max().alias(f"{metric}_max"),
-                        pl.col(metric).count().alias(f"{metric}_count")
-                    ])
-            
-            if agg_exprs:
-                df_state = df.group_by([state_col, "date"]).agg(agg_exprs)
-                results["state"] = df_state
-    
-    # Metro level if available
-    if region_cols.get("metro") is not None and region_cols["metro"] in df.columns and "date" in df.columns:
-        metro_col = region_cols["metro"]
-        agg_exprs = []
-        for metric in metric_cols:
-            if df[metric].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]:
-                agg_exprs.append(pl.col(metric).mean().alias(f"{metric}_mean"))
-        
-        if agg_exprs:
-            # Include state if available for hierarchy
-            group_cols = [metro_col, "date"]
-            if region_cols.get("state") is not None and region_cols["state"] in df.columns:
-                group_cols.insert(0, region_cols["state"])
-            
-            df_metro = df.group_by(group_cols).agg(agg_exprs)
-            results["metro"] = df_metro
-    
-    # County level if available
-    if region_cols.get("county") is not None and region_cols["county"] in df.columns and "date" in df.columns:
-        county_col = region_cols["county"]
-        agg_exprs = []
-        for metric in metric_cols:
-            if df[metric].dtype in [pl.Float32, pl.Float64, pl.Int32, pl.Int64]:
-                agg_exprs.append(pl.col(metric).mean().alias(f"{metric}_mean"))
-        
-        if agg_exprs:
-            group_cols = [county_col, "date"]
-            if region_cols.get("state") is not None and region_cols["state"] in df.columns:
-                group_cols.insert(0, region_cols["state"])
-            
-            df_county = df.group_by(group_cols).agg(agg_exprs)
-            results["county"] = df_county
-    
-    return results, metrics
+
+    # 2) load
+    df = pl.scan_parquet([str(p) for p in shards]).collect()
+
+    # 3) normalize config key
+    cfg = config_name.strip().lower()
+    if cfg not in ZILLOW_BASE_COLS:
+        for k in ZILLOW_BASE_COLS:
+            if cfg.startswith(k):
+                cfg = k
+                break
+    if cfg not in ZILLOW_BASE_COLS:
+        raise ValueError(f"Unknown Zillow config '{config_name}'")
+
+    base_cols = ZILLOW_BASE_COLS[cfg]
+
+    # 4) Date → 'date' (datetime)
+    if "Date" in df.columns:
+        if df["Date"].dtype in (pl.Int64, pl.Int32):
+            df = df.with_columns(pl.from_epoch(pl.col("Date").cast(pl.Int64), unit="ms").alias("date"))
+        elif df["Date"].dtype == pl.Utf8:
+            df = df.with_columns(pl.col("Date").str.strptime(pl.Datetime, strict=False).alias("date"))
+        elif df["Date"].dtype in (pl.Datetime, pl.Date):
+            df = df.with_columns(pl.col("Date").cast(pl.Datetime).alias("date"))
+        else:
+            df = df.with_columns(pl.from_epoch(pl.col("Date").cast(pl.Int64), unit="ms").alias("date"))
+    else:
+        if "date" not in df.columns:
+            raise ValueError(f"{config_name}: no Date column")
+
+    out = df
+
+    # 5) region_id / region_name
+    if "Region ID" in out.columns:
+        out = out.with_columns(pl.col("Region ID").cast(pl.Utf8).alias("region_id"))
+    else:
+        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("region_id"))
+
+    if "Region" in out.columns:
+        out = out.with_columns(pl.col("Region").cast(pl.Utf8).alias("region_name"))
+    else:
+        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("region_name"))
+
+    # 6) Region Type mapping (fix: no Expr.dtype; cast first, then branch on nulls)
+    if "Region Type" in out.columns:
+        map_dict = ZILLOW_REGION_TYPE.get(cfg, {})
+        out = out.with_columns([
+            pl.col("Region Type").cast(pl.Int64, strict=False).alias("_rt_code"),
+            pl.col("Region Type").cast(pl.Utf8).alias("_rt_str"),
+        ])
+        out = out.with_columns(
+            pl.when(pl.col("_rt_code").is_not_null())
+              .then(pl.col("_rt_code").map_elements(lambda v: map_dict.get(int(v)) if v is not None else None, return_dtype=pl.Utf8))
+              .otherwise(pl.col("_rt_str"))
+              .alias("region_level")
+        ).drop(["_rt_code", "_rt_str"])
+    else:
+        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("region_level"))
+
+    # 7) Home Type mapping (same pattern)
+    if "Home Type" in out.columns:
+        if cfg in ZILLOW_HOME_TYPE_BY_CONFIG:
+            ht_map = ZILLOW_HOME_TYPE_BY_CONFIG[cfg]
+            out = out.with_columns([
+                pl.col("Home Type").cast(pl.Int64, strict=False).alias("_ht_code"),
+                pl.col("Home Type").cast(pl.Utf8).alias("_ht_str"),
+            ])
+            out = out.with_columns(
+                pl.when(pl.col("_ht_code").is_not_null())
+                  .then(pl.col("_ht_code").map_elements(lambda v: ht_map.get(int(v)) if v is not None else None, return_dtype=pl.Utf8))
+                  .otherwise(pl.col("_ht_str"))
+                  .alias("home_type")
+            ).drop(["_ht_code", "_ht_str"])
+        else:
+            # forecasts: keep as text
+            out = out.with_columns(pl.col("Home Type").cast(pl.Utf8).alias("home_type"))
+    else:
+        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("home_type"))
+
+    # 8) Bedroom Count (home_values only) with safe cast
+    if cfg == "home_values" and "Bedroom Count" in out.columns:
+        out = out.with_columns([
+            pl.col("Bedroom Count").cast(pl.Int64, strict=False).alias("_bed_code")
+        ])
+        out = out.with_columns(
+            pl.col("_bed_code").map_elements(
+                lambda v: ZILLOW_BEDROOM_LABELS.get(int(v)) if v is not None else None,
+                return_dtype=pl.Utf8
+            ).alias("bedrooms")
+        ).drop("_bed_code")
+    else:
+        if "Bedroom Count" in out.columns:
+            out = out.with_columns(pl.col("Bedroom Count").cast(pl.Utf8).alias("bedrooms"))
+        else:
+            out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("bedrooms"))
+
+    # 9) time parts
+    out = out.with_columns([
+        pl.col("date").dt.year().alias("year"),
+        pl.col("date").dt.month().alias("month"),
+        pl.col("date").dt.quarter().alias("quarter"),
+    ])
+
+    # 10) passthrough dims for forecasts if present
+    dim_passthrough = [c for c in ("City","County","Metro","State") if c in out.columns]
+
+    # 11) value columns = numeric columns NOT in base + not in our helper IDs
+    present_base = {c for c in base_cols if c in out.columns}
+    helper_cols = {
+        "region_id","region_name","region_level","home_type","bedrooms",
+        "date","year","month","quarter","Size Rank"
+    }.union(dim_passthrough)
+
+    candidate_vals = [c for c in out.columns if c not in present_base and c not in helper_cols]
+    value_cols = []
+    schema_map = out.schema  # faster than out[c].dtype repeatedly
+    for c in candidate_vals:
+        dtp = schema_map[c]
+        if dtp.is_numeric() or dtp in (pl.Float32, pl.Float64, pl.Int64, pl.Int32):
+            value_cols.append(c)
+
+    # 12) wide
+    keep_cols = [c for c in ["region_id","region_name","region_level","home_type","bedrooms",
+                             "date","year","month","quarter","Size Rank"] if c in out.columns]
+    keep_cols += dim_passthrough
+    wide = out.select(keep_cols + value_cols).sort(
+        [c for c in ["region_level","region_name","home_type","bedrooms","date"] if c in keep_cols]
+    )
+
+    # 13) long
+    id_cols = [c for c in (keep_cols) if c in wide.columns]
+    if value_cols:
+        long = wide.melt(id_vars=id_cols, value_vars=value_cols, variable_name="metric", value_name="value")
+        long = long.with_columns([
+            pl.col("metric").str.contains("Smoothed").alias("is_smoothed"),
+            pl.col("metric").str.contains("Seasonally Adjusted").alias("is_seasonally_adjusted"),
+            pl.col("metric").str.contains(r"\(Raw\)").alias("is_raw"),
+        ])
+    else:
+        long = wide.with_columns([
+            pl.lit(None).alias("metric"),
+            pl.lit(None, dtype=pl.Float64).alias("value"),
+            pl.lit(False).alias("is_smoothed"),
+            pl.lit(False).alias("is_seasonally_adjusted"),
+            pl.lit(False).alias("is_raw"),
+        ])
+
+    # 14) return two tables; your saver will write them out
+    return {"wide": wide, "long": long}, {}
+
 
 
 def save_silver_data(config_name: str, results: Dict[str, pl.DataFrame], 
