@@ -626,7 +626,12 @@ def transform_fred_data(bronze_path: pathlib.Path, silver_path: pathlib.Path) ->
         saved = {"original": str(original_path)}
         
         # Create monthly version for easier joining
-        if frequency != "monthly" and frequency != "unknown":
+        if frequency == "monthly":
+            # Already monthly, just save as is
+            monthly_path = series_path / "monthly.parquet"
+            df.write_parquet(str(monthly_path))
+            saved["monthly"] = str(monthly_path)
+        elif frequency != "unknown":
             # Resample to monthly
             value_col = [c for c in df.columns if c not in ["date", "year", "month", "quarter"]][0]
             
@@ -640,9 +645,26 @@ def transform_fred_data(bronze_path: pathlib.Path, silver_path: pathlib.Path) ->
                     pl.col(value_col).std().alias(f"{value_col}_std"),
                     pl.col(value_col).count().alias("observations")
                 ])
+                # Normalize date to first day of month and add quarter column
+                df_monthly = df_monthly.with_columns([
+                    pl.date(pl.col("year").cast(pl.Int32), pl.col("month").cast(pl.Int32), 1).alias("date"),
+                    pl.col("date").dt.quarter().alias("quarter")
+                ])
+                # Sort by date to ensure chronological order
+                df_monthly = df_monthly.sort("date")
             else:  # quarterly or annual
-                # Forward fill to monthly
-                df_monthly = df.set_sorted("date").upsample("date", every="1mo").interpolate()
+                # Forward fill to monthly - only interpolate the value column, not date components
+                df_monthly = df.set_sorted("date").upsample("date", every="1mo")
+                # Forward fill the value column
+                df_monthly = df_monthly.with_columns([
+                    pl.col(value_col).forward_fill()
+                ])
+                # Recalculate date components from the upsampled date
+                df_monthly = df_monthly.with_columns([
+                    pl.col("date").dt.year().alias("year"),
+                    pl.col("date").dt.month().alias("month"),
+                    pl.col("date").dt.quarter().alias("quarter")
+                ])
             
             monthly_path = series_path / "monthly.parquet"
             df_monthly.write_parquet(str(monthly_path))
@@ -683,9 +705,12 @@ def transform_fred_data(bronze_path: pathlib.Path, silver_path: pathlib.Path) ->
     
     if monthly_frames:
         # Combine all dataframes by concatenating horizontally after ensuring all have same dates
-        # First get all unique dates
+        # First get all unique dates - convert to datetime for consistency
         all_dates = set()
         for frame in monthly_frames:
+            # Ensure date column is datetime
+            if frame["date"].dtype == pl.Date:
+                frame = frame.with_columns(pl.col("date").cast(pl.Datetime))
             all_dates.update(frame["date"].to_list())
         
         # Create base dataframe with all dates
@@ -693,6 +718,9 @@ def transform_fred_data(bronze_path: pathlib.Path, silver_path: pathlib.Path) ->
         
         # Join each series
         for frame in monthly_frames:
+            # Ensure date column is datetime for joining
+            if frame["date"].dtype == pl.Date:
+                frame = frame.with_columns(pl.col("date").cast(pl.Datetime))
             # Get the non-date column name
             value_col = [c for c in frame.columns if c != "date"][0]
             # Join with suffix handling
