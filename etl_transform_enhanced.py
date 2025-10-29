@@ -419,22 +419,24 @@ def standardize_dates(df: pl.DataFrame, date_cols: List[str]) -> pl.DataFrame:
 
 def transform_zillow_dataset(config_name: str, bronze_path: pathlib.Path, schema_mgr: SchemaManager) -> Dict[str, pl.DataFrame]:
     """
-    Transform ONE Zillow config folder into:
-      - 'wide' (cleaned base columns + all value columns)
-      - 'long' (normalized: one row per metric per date per region/home-type)
-    We DO NOT aggregate or guess region level; we map label-encodings per config.
+    Zillow Transform (Enhanced but Faithful)
+    - Keeps all raw columns exactly as-is.
+    - Adds: standardized datetime column, readable region/home type labels, date parts.
+    - Does NOT remove or rename any original field.
+    - Produces both 'wide' (original) and 'long' normalized forms.
     """
-    # 1) locate parquet shards
+
+    # 1. Locate parquet shards
     shards = list(bronze_path.glob("*.parquet"))
     if not shards:
         shards = list((bronze_path / "train").glob("*.parquet"))
     if not shards:
         raise ValueError(f"No parquet files found in {bronze_path}")
 
-    # 2) load
+    # 2. Load
     df = pl.scan_parquet([str(p) for p in shards]).collect()
 
-    # 3) normalize config key
+    # 3. Normalize dataset key
     cfg = config_name.strip().lower()
     if cfg not in ZILLOW_BASE_COLS:
         for k in ZILLOW_BASE_COLS:
@@ -444,140 +446,74 @@ def transform_zillow_dataset(config_name: str, bronze_path: pathlib.Path, schema
     if cfg not in ZILLOW_BASE_COLS:
         raise ValueError(f"Unknown Zillow config '{config_name}'")
 
-    base_cols = ZILLOW_BASE_COLS[cfg]
-
-    # 4) Date → 'date' (datetime)
+    # 4. Standardize Date → 'date' (Datetime)
     if "Date" in df.columns:
-        if df["Date"].dtype in (pl.Int64, pl.Int32):
+        dtype = df["Date"].dtype
+        if dtype in (pl.Int64, pl.Int32, pl.UInt64, pl.UInt32):
             df = df.with_columns(pl.from_epoch(pl.col("Date").cast(pl.Int64), unit="ms").alias("date"))
-        elif df["Date"].dtype == pl.Utf8:
+        elif dtype == pl.Utf8:
             df = df.with_columns(pl.col("Date").str.strptime(pl.Datetime, strict=False).alias("date"))
-        elif df["Date"].dtype in (pl.Datetime, pl.Date):
+        elif dtype in (pl.Datetime, pl.Date):
             df = df.with_columns(pl.col("Date").cast(pl.Datetime).alias("date"))
         else:
             df = df.with_columns(pl.from_epoch(pl.col("Date").cast(pl.Int64), unit="ms").alias("date"))
-    else:
-        if "date" not in df.columns:
-            raise ValueError(f"{config_name}: no Date column")
+    elif "date" not in df.columns:
+        raise ValueError(f"{config_name}: missing Date column")
 
-    out = df
+    # 5. Add readable region type if present
+    if "Region Type" in df.columns:
+        region_map = ZILLOW_REGION_TYPE.get(cfg, {})
+        df = df.with_columns(
+            pl.col("Region Type")
+              .cast(pl.Int64, strict=False)
+              .map_elements(lambda x: region_map.get(x, None), return_dtype=pl.Utf8)
+              .alias("Region Type Name")
+        )
 
-    # 5) region_id / region_name
-    if "Region ID" in out.columns:
-        out = out.with_columns(pl.col("Region ID").cast(pl.Utf8).alias("region_id"))
-    else:
-        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("region_id"))
-
-    if "Region" in out.columns:
-        out = out.with_columns(pl.col("Region").cast(pl.Utf8).alias("region_name"))
-    else:
-        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("region_name"))
-
-    # 6) Region Type mapping (fix: no Expr.dtype; cast first, then branch on nulls)
-    if "Region Type" in out.columns:
-        map_dict = ZILLOW_REGION_TYPE.get(cfg, {})
-        out = out.with_columns([
-            pl.col("Region Type").cast(pl.Int64, strict=False).alias("_rt_code"),
-            pl.col("Region Type").cast(pl.Utf8).alias("_rt_str"),
-        ])
-        out = out.with_columns(
-            pl.when(pl.col("_rt_code").is_not_null())
-              .then(pl.col("_rt_code").map_elements(lambda v: map_dict.get(int(v)) if v is not None else None, return_dtype=pl.Utf8))
-              .otherwise(pl.col("_rt_str"))
-              .alias("region_level")
-        ).drop(["_rt_code", "_rt_str"])
-    else:
-        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("region_level"))
-
-    # 7) Home Type mapping (same pattern)
-    if "Home Type" in out.columns:
-        if cfg in ZILLOW_HOME_TYPE_BY_CONFIG:
-            ht_map = ZILLOW_HOME_TYPE_BY_CONFIG[cfg]
-            out = out.with_columns([
-                pl.col("Home Type").cast(pl.Int64, strict=False).alias("_ht_code"),
-                pl.col("Home Type").cast(pl.Utf8).alias("_ht_str"),
-            ])
-            out = out.with_columns(
-                pl.when(pl.col("_ht_code").is_not_null())
-                  .then(pl.col("_ht_code").map_elements(lambda v: ht_map.get(int(v)) if v is not None else None, return_dtype=pl.Utf8))
-                  .otherwise(pl.col("_ht_str"))
-                  .alias("home_type")
-            ).drop(["_ht_code", "_ht_str"])
+    # 6. Add readable home type if present
+    if "Home Type" in df.columns:
+        home_map = ZILLOW_HOME_TYPE_BY_CONFIG.get(cfg)
+        if home_map:
+            df = df.with_columns(
+                pl.col("Home Type")
+                  .cast(pl.Int64, strict=False)
+                  .map_elements(lambda x: home_map.get(x, None), return_dtype=pl.Utf8)
+                  .alias("Home Type Name")
+            )
         else:
-            # forecasts: keep as text
-            out = out.with_columns(pl.col("Home Type").cast(pl.Utf8).alias("home_type"))
-    else:
-        out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("home_type"))
+            # leave text-based types as is
+            df = df.with_columns(pl.col("Home Type").cast(pl.Utf8).alias("Home Type Name"))
 
-    # 8) Bedroom Count (home_values only) with safe cast
-    if cfg == "home_values" and "Bedroom Count" in out.columns:
-        out = out.with_columns([
-            pl.col("Bedroom Count").cast(pl.Int64, strict=False).alias("_bed_code")
-        ])
-        out = out.with_columns(
-            pl.col("_bed_code").map_elements(
-                lambda v: ZILLOW_BEDROOM_LABELS.get(int(v)) if v is not None else None,
-                return_dtype=pl.Utf8
-            ).alias("bedrooms")
-        ).drop("_bed_code")
-    else:
-        if "Bedroom Count" in out.columns:
-            out = out.with_columns(pl.col("Bedroom Count").cast(pl.Utf8).alias("bedrooms"))
-        else:
-            out = out.with_columns(pl.lit(None, dtype=pl.Utf8).alias("bedrooms"))
+    # 7. Decode Bedroom Count if available
+    if "Bedroom Count" in df.columns:
+        df = df.with_columns(
+            pl.col("Bedroom Count")
+              .cast(pl.Int64, strict=False)
+              .map_elements(lambda x: ZILLOW_BEDROOM_LABELS.get(x, None), return_dtype=pl.Utf8)
+              .alias("Bedroom Label")
+        )
 
-    # 9) time parts
-    out = out.with_columns([
-        pl.col("date").dt.year().alias("year"),
-        pl.col("date").dt.month().alias("month"),
-        pl.col("date").dt.quarter().alias("quarter"),
-    ])
-
-    # 10) passthrough dims for forecasts if present
-    dim_passthrough = [c for c in ("City","County","Metro","State") if c in out.columns]
-
-    # 11) value columns = numeric columns NOT in base + not in our helper IDs
-    present_base = {c for c in base_cols if c in out.columns}
-    helper_cols = {
-        "region_id","region_name","region_level","home_type","bedrooms",
-        "date","year","month","quarter","Size Rank"
-    }.union(dim_passthrough)
-
-    candidate_vals = [c for c in out.columns if c not in present_base and c not in helper_cols]
-    value_cols = []
-    schema_map = out.schema  # faster than out[c].dtype repeatedly
-    for c in candidate_vals:
-        dtp = schema_map[c]
-        if dtp.is_numeric() or dtp in (pl.Float32, pl.Float64, pl.Int64, pl.Int32):
-            value_cols.append(c)
-
-    # 12) wide
-    keep_cols = [c for c in ["region_id","region_name","region_level","home_type","bedrooms",
-                             "date","year","month","quarter","Size Rank"] if c in out.columns]
-    keep_cols += dim_passthrough
-    wide = out.select(keep_cols + value_cols).sort(
-        [c for c in ["region_level","region_name","home_type","bedrooms","date"] if c in keep_cols]
-    )
-
-    # 13) long
-    id_cols = [c for c in (keep_cols) if c in wide.columns]
-    if value_cols:
-        long = wide.melt(id_vars=id_cols, value_vars=value_cols, variable_name="metric", value_name="value")
-        long = long.with_columns([
-            pl.col("metric").str.contains("Smoothed").alias("is_smoothed"),
-            pl.col("metric").str.contains("Seasonally Adjusted").alias("is_seasonally_adjusted"),
-            pl.col("metric").str.contains(r"\(Raw\)").alias("is_raw"),
-        ])
-    else:
-        long = wide.with_columns([
-            pl.lit(None).alias("metric"),
-            pl.lit(None, dtype=pl.Float64).alias("value"),
-            pl.lit(False).alias("is_smoothed"),
-            pl.lit(False).alias("is_seasonally_adjusted"),
-            pl.lit(False).alias("is_raw"),
+    # 8. Add time decomposition columns
+    if "date" in df.columns:
+        df = df.with_columns([
+            pl.col("date").dt.year().alias("year"),
+            pl.col("date").dt.month().alias("month"),
+            pl.col("date").dt.quarter().alias("quarter")
         ])
 
-    # 14) return two tables; your saver will write them out
+    # 9. Keep all columns (wide version)
+    wide = df
+
+    # 10. Create long version for metrics
+    id_cols = [c for c in df.columns if c.lower() in (
+        "region id", "region", "region type", "region type name",
+        "home type", "home type name", "bedroom count", "bedroom label",
+        "date", "year", "month", "quarter", "size rank", "state", "city", "metro", "county"
+    )]
+    value_cols = [c for c in df.columns if c not in id_cols]
+
+    long = df.melt(id_vars=id_cols, value_vars=value_cols, variable_name="metric", value_name="value")
+
     return {"wide": wide, "long": long}, {}
 
 
