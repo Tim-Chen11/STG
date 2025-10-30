@@ -1,18 +1,4 @@
 ﻿#!/usr/bin/env python3
-"""
-Step 2: Make needed transformations on the gold FRED monthly sheet.
-
-Reads:  data/gold/fred/unified_monthly.parquet
-Writes: data/gold/fred/unified_monthly_enriched.parquet and .csv
-
-Adds columns (YoY as fractions unless noted):
-- cpi_yoy                = CPI / CPI_12m_ago - 1
-- real_mortgage          = mortgage_rate - (cpi_yoy * 100)  [percent points]
-- permits_yoy            = building_permits / building_permits_12m_ago - 1
-- starts_yoy             = housing_starts / housing_starts_12m_ago - 1
-- natl_price_yoy         = price / price_12m_ago - 1 (prefers monthly existing-home price)
-- income_yoy (optional)  = income_median / income_median_12m_ago - 1
-"""
 
 from pathlib import Path
 import shutil
@@ -143,11 +129,108 @@ def main() -> None:
             .alias("macro_regime")
         )
 
+    # --------------------------------------------------------------
+    # 6. QUICK AFFORDABILITY GAUGES
+    # --------------------------------------------------------------
+    import math
+
+    # Use forward-filled slow series to avoid N/A in latest month
+    price_source = "median_sales_price"
+    if "median_sales_price_existing" in df.columns:
+        price_source = "median_sales_price_existing"
+
+    if price_source in df.columns and "income_median" in df.columns:
+        df = df.with_columns([
+            pl.col(price_source).forward_fill().alias("price_ff"),
+            pl.col("income_median").forward_fill().alias("income_ff")
+        ])
+
+        # 1) Price-to-Income
+        df = df.with_columns((pl.col("price_ff") / pl.col("income_ff")).alias("price_to_income"))
+
+        # 2) Monthly payment from mortgage rate and forward-filled price
+        def mortgage_payment(price, rate_percent, years=30):
+            if price is None or rate_percent is None:
+                return None
+            r = rate_percent / 100 / 12
+            n = years * 12
+            if r == 0:
+                return price / n
+            return price * r * (1 + r) ** n / ((1 + r) ** n - 1)
+
+        df = df.with_columns(
+            pl.struct(["price_ff", "mortgage_rate"])  
+              .map_elements(lambda s: mortgage_payment(s["price_ff"], s["mortgage_rate"]), return_dtype=pl.Float64)
+              .alias("monthly_payment")
+        )
+
+        # 3) Payment-to-Income
+        df = df.with_columns((pl.col("monthly_payment") / (pl.col("income_ff") / 12)).alias("payment_to_income"))
+
+        # 4) Baseline window AFTER all columns exist
+        afford_df = df.filter(pl.col("date") >= pl.datetime(2015, 1, 1))
+
+        # --- P/I Stats ---
+        pi_window = afford_df.filter(pl.col("price_to_income").is_not_null())
+        pi_mean = float(pi_window["price_to_income"].mean() or 0.0)
+        pi_std = float(pi_window["price_to_income"].std() or 1.0)
+
+        df = df.with_columns(((pl.col("price_to_income") - pi_mean) / pi_std).alias("pi_z"))
+
+        # --- Pay/I Stats ---
+        payi_window = afford_df.filter(pl.col("payment_to_income").is_not_null())
+        payi_mean = float(payi_window["payment_to_income"].mean() or 0.0)
+        payi_std = float(payi_window["payment_to_income"].std() or 1.0)
+
+        df = df.with_columns(((pl.col("payment_to_income") - payi_mean) / payi_std).alias("payi_z"))
+
+        # --- Status ---
+        df = df.with_columns(
+            pl.when(pl.col("pi_z") <= -0.5).then(pl.lit("Below Trend (Green)"))
+              .when(pl.col("pi_z").abs() <= 0.5).then(pl.lit("At Trend (Yellow)"))
+              .otherwise(pl.lit("Above Trend (Red)"))
+              .alias("pi_status")
+        )
+        df = df.with_columns(
+            pl.when(pl.col("payi_z") <= -0.5).then(pl.lit("Below Trend (Green)"))
+              .when(pl.col("payi_z").abs() <= 0.5).then(pl.lit("At Trend (Yellow)"))
+              .otherwise(pl.lit("Above Trend (Red)"))
+              .alias("payi_status")
+        )
+
+        df = df.drop(["pi_z", "payi_z"])  # keep clean outputs
+
+    # --- Print (null-safe) ---
+    latest = df.tail(1).select([
+        "date",
+        pl.col("price_to_income"),
+        pl.col("payment_to_income"),
+        "pi_status",
+        "payi_status"
+    ]).row(0, named=True)
+
+    def _fmt_float(v, d=2):
+        try:
+            return f"{float(v):.{d}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v, d=1):
+        try:
+            return f"{float(v):.{d}%}"
+        except Exception:
+            return "N/A"
+
+    print("\n=== AFFORDABILITY GAUGES (latest month) ===")
+    print(f"Date               : {latest.get('date')}")
+    print(f"Price-to-Income    : {_fmt_float(latest.get('price_to_income'), 2)}    {latest.get('pi_status') or 'N/A'}")
+    print(f"Payment-to-Income  : {_fmt_pct(latest.get('payment_to_income'), 1)}    {latest.get('payi_status') or 'N/A'}")
+    print("============================================\n")
+    
     # --- 4. Save gold ------------------------------------------------------------
     GOLD_DIR.mkdir(parents=True, exist_ok=True)
     df.write_parquet(str(OUT_PQ))
     print(f"Wrote: {OUT_PQ}")
-    print(f"Wrote: {OUT_CSV}")
 
     # --- Step 4: Charts ----------------------------------------------------------
     try:
@@ -185,6 +268,34 @@ def main() -> None:
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
             fig.autofmt_xdate()
 
+            # Affordability Summary Box
+            if "pi_status" in plot_df.columns and "payi_status" in plot_df.columns:
+                latest = plot_df.tail(1)
+                pi_val = latest["price_to_income"].item()
+                payi_val = latest["payment_to_income"].item()
+                pi_status = latest["pi_status"].item() or "N/A"
+                payi_status = latest["payi_status"].item() or "N/A"
+
+                if pi_val is not None and payi_val is not None:
+                    summary_text = (
+                        f"House Price/Income: {pi_val:.2f} → {pi_status.split()[0]}\n"
+                        f"Mortgage payment/Income: {payi_val:.1%} → {payi_status.split()[0]}"
+                    )
+                    # Color-code the box
+                    pi_color = {"Green": "lightgreen", "Yellow": "wheat", "Red": "lightcoral"}.get(
+                        pi_status.split()[0], "gray"
+                    )
+                    payi_color = {"Green": "lightgreen", "Yellow": "wheat", "Red": "lightcoral"}.get(
+                        payi_status.split()[0], "gray"
+                    )
+
+                    # Place in top-right
+                    ax.text(0.98, 0.98, summary_text,
+                            transform=ax.transAxes,
+                            fontsize=10, fontweight='bold',
+                            verticalalignment='top', horizontalalignment='right',
+                            bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.95, edgecolor="black"))
+                    
             legend_patches = [Patch(facecolor=c, alpha=0.3, label=r) for r, c in colors.items()]
             ax.legend(handles=legend_patches, loc="upper left")
 
@@ -228,3 +339,4 @@ def main() -> None:
 if __name__ == "__main__":
     copy_fred_unified()
     main()
+
