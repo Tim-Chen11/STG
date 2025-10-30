@@ -27,7 +27,7 @@ BRONZE = BASE_OUT / "raw"
 ZILLOW_ID = "misikoff/zillow-viewer"
 ZILLOW_REV = "~parquet"  # auto-parquet branch
 
-# FRED series (validated IDs)
+# FRED series (validated IDs) - Updated for monthly Nmsp and added NDOM
 FRED_SERIES: Dict[str, str] = {
     "mortgage_rate": "MORTGAGE30US",   # weekly, %
     "cpi": "CPIAUCSL",                 # monthly, index
@@ -35,7 +35,8 @@ FRED_SERIES: Dict[str, str] = {
     "unemployment_rate": "UNRATE",     # monthly, %
     "building_permits": "PERMIT",      # monthly, SAAR
     "housing_starts": "HOUST",         # monthly, SAAR
-    "median_sales_price": "MSPUS",     # quarterly, $
+    "median_sales_price": "MSPNHSUS",  # CHANGED: monthly existing homes median price ($)
+    "median_days_on_market": "MEDDAYONMARUS",  # ADDED: monthly national DOM (days)
 }
 FRED_CSV_BASE = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 
